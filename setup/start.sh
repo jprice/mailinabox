@@ -27,7 +27,7 @@ export LC_TYPE=en_US.UTF-8
 if [ -f /etc/mailinabox.conf ]; then
 	# Run any system migrations before proceeding. Since this is a second run,
 	# we assume we have Python already installed.
-	setup/migrate.py --migrate
+	setup/migrate.py --migrate || exit 1
 
 	# Load the old .conf file to get existing configuration options loaded
 	# into variables with a DEFAULT_ prefix.
@@ -77,7 +77,7 @@ fi
 if [ "$PRIVATE_IPV6" != "$PUBLIC_IPV6" ]; then
 	echo "Private IPv6 Address: $PRIVATE_IPV6"
 fi
-if [ -f /usr/bin/git ]; then
+if [ -f .git ]; then
 	echo "Mail-in-a-Box Version: " $(git describe)
 fi
 echo
@@ -87,16 +87,36 @@ if [ -z "$SKIP_NETWORK_CHECKS" ]; then
 	. setup/network-checks.sh
 fi
 
+# For the first time (if the config file (/etc/mailinabox.conf) not exists):
 # Create the user named "user-data" and store all persistent user
 # data (mailboxes, etc.) in that user's home directory.
+#
+# If the config file exists:
+# Apply the existing configuration options for STORAGE_USER/ROOT
+if [ -z "$STORAGE_USER" ]; then
+	STORAGE_USER=$([[ -z "$DEFAULT_STORAGE_USER" ]] && echo "user-data" || echo "$DEFAULT_STORAGE_USER")
+fi
+
 if [ -z "$STORAGE_ROOT" ]; then
-	STORAGE_USER=user-data
-	if [ ! -d /home/$STORAGE_USER ]; then useradd -m $STORAGE_USER; fi
-	STORAGE_ROOT=/home/$STORAGE_USER
+	STORAGE_ROOT=$([[ -z "$DEFAULT_STORAGE_ROOT" ]] && echo "/home/$STORAGE_USER" || echo "$DEFAULT_STORAGE_ROOT")
+fi
+
+# Create the STORAGE_USER if it not exists
+if ! id -u $STORAGE_USER >/dev/null 2>&1; then
+	useradd -m $STORAGE_USER
+fi
+
+# Create the STORAGE_ROOT if it not exists
+if [ ! -d $STORAGE_ROOT ]; then
 	mkdir -p $STORAGE_ROOT
+fi
+
+# Create mailinabox.version file if not exists
+if [ ! -f $STORAGE_ROOT/mailinabox.version ]; then
 	echo $(setup/migrate.py --current) > $STORAGE_ROOT/mailinabox.version
 	chown $STORAGE_USER.$STORAGE_USER $STORAGE_ROOT/mailinabox.version
 fi
+
 
 # Save the global options in /etc/mailinabox.conf so that standalone
 # tools know where to look for data.
@@ -126,10 +146,13 @@ source setup/owncloud.sh
 source setup/zpush.sh
 source setup/management.sh
 
-# Write the DNS and nginx configuration files.
-sleep 5 # wait for the daemon to start
-curl -s -d POSTDATA --user $(</var/lib/mailinabox/api.key): http://127.0.0.1:10222/dns/update
-curl -s -d POSTDATA --user $(</var/lib/mailinabox/api.key): http://127.0.0.1:10222/web/update
+# Ping the management daemon to write the DNS and nginx configuration files.
+while [ ! -f /var/lib/mailinabox/api.key ]; do
+	echo Waiting for the Mail-in-a-Box management daemon to start...
+	sleep 2
+done
+tools/dns_update
+tools/web_update
 
 # If there aren't any mail users yet, create one.
 source setup/firstuser.sh

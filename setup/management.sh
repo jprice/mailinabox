@@ -3,7 +3,8 @@
 source setup/functions.sh
 
 apt_install python3-flask links duplicity libyaml-dev python3-dnspython python3-dateutil
-hide_output pip3 install rtyaml
+hide_output pip3 install rtyaml "email_validator==0.1.0-rc5"
+	# email_validator is repeated in setup/questions.sh
 
 # Create a backup directory and a random key for encrypting backups.
 mkdir -p $STORAGE_ROOT/backup
@@ -30,5 +31,19 @@ $(pwd)/management/backup.py
 EOF
 chmod +x /etc/cron.daily/mailinabox-backup
 
-# Start it.
+# Perform daily status checks. Compare each day to the previous
+# for changes and mail the changes to the administrator.
+cat > /etc/cron.daily/mailinabox-statuschecks << EOF;
+#!/bin/bash
+# Mail-in-a-Box --- Do not edit / will be overwritten on update.
+# Run status checks.
+$(pwd)/management/status_checks.py --show-changes --smtp
+EOF
+chmod +x /etc/cron.daily/mailinabox-statuschecks
+
+
+# Start it. Remove the api key file first so that start.sh
+# can wait for it to be created to know that the management
+# server is ready.
+rm -f /var/lib/mailinabox/api.key
 restart_service mailinabox

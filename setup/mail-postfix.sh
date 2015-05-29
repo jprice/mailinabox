@@ -62,6 +62,11 @@ tools/editconf.py /etc/postfix/main.cf \
 
 # Enable the 'submission' port 587 smtpd server and tweak its settings.
 #
+# * Do not add the OpenDMAC Authentication-Results header. That should only be added
+#   on incoming mail. Omit the OpenDMARC milter by re-setting smtpd_milters to the
+#   OpenDKIM milter only. See dkim.sh.
+# * Even though we dont allow auth over non-TLS connections (smtpd_tls_auth_only below, and without auth the client cant
+#   send outbound mail), don't allow non-TLS mail submission on this port anyway to prevent accidental misconfiguration.
 # * Require the best ciphers for incoming connections per http://baldric.net/2013/12/07/tls-ciphers-in-postfix-and-dovecot/.
 #   By putting this setting here we leave opportunistic TLS on incoming mail at default cipher settings (any cipher is better than none).
 # * Give it a different name in syslog to distinguish it from the port 25 smtpd server.
@@ -71,7 +76,9 @@ tools/editconf.py /etc/postfix/main.cf \
 tools/editconf.py /etc/postfix/master.cf -s -w \
 	"submission=inet n       -       -       -       -       smtpd
 	  -o syslog_name=postfix/submission
-	  -o smtpd_tls_ciphers=high -o smtpd_tls_protocols=!SSLv2,!SSLv3
+	  -o smtpd_milters=inet:127.0.0.1:8891
+	  -o smtpd_tls_security_level=encrypt
+	  -o smtpd_tls_ciphers=high -o smtpd_tls_exclude_ciphers=aNULL,DES,3DES,MD5,DES+MD5,RC4 -o smtpd_tls_mandatory_protocols=!SSLv2,!SSLv3
 	  -o cleanup_service_name=authclean" \
 	"authclean=unix  n       -       -       -       0       cleanup
 	  -o header_checks=pcre:/etc/postfix/outgoing_mail_header_filters"
@@ -90,6 +97,8 @@ tools/editconf.py /etc/postfix/main.cf \
 	smtpd_tls_cert_file=$STORAGE_ROOT/ssl/ssl_certificate.pem \
 	smtpd_tls_key_file=$STORAGE_ROOT/ssl/ssl_private_key.pem \
 	smtpd_tls_dh1024_param_file=$STORAGE_ROOT/ssl/dh2048.pem \
+	smtpd_tls_ciphers=medium \
+	smtpd_tls_exclude_ciphers=aNULL \
 	smtpd_tls_received_header=yes
 
 # Prevent non-authenticated users from sending mail that requires being
@@ -162,8 +171,13 @@ tools/editconf.py /etc/postfix/main.cf \
 
 # Postfix connects to Postgrey on the 127.0.0.1 interface specifically. Ensure that
 # Postgrey listens on the same interface (and not IPv6, for instance).
+# A lot of legit mail servers try to resend before 300 seconds.
+# As a matter of fact RFC is not strict about retry timer so postfix and
+# other MTA have their own intervals. To fix the problem of receiving
+# e-mails really latter, delay of greylisting has been set to
+# 180 seconds (default is 300 seconds).
 tools/editconf.py /etc/default/postgrey \
-	POSTGREY_OPTS=\"--inet=127.0.0.1:10023\"
+	POSTGREY_OPTS=\"'--inet=127.0.0.1:10023 --delay=180'\"
 
 # Increase the message size limit from 10MB to 128MB.
 # The same limit is specified in nginx.conf for mail submitted via webmail and Z-Push.
@@ -178,3 +192,4 @@ ufw_allow submission
 # Restart services
 
 restart_service postfix
+restart_service postgrey

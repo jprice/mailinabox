@@ -2,7 +2,7 @@
 # domains for which a mail account has been set up.
 ########################################################################
 
-import os, os.path, shutil, re, rtyaml
+import os, os.path, shutil, re, tempfile, rtyaml
 
 from mailconfig import get_mail_domains
 from dns_update import get_custom_dns_config, do_dns_update
@@ -17,19 +17,16 @@ def get_web_domains(env):
 	domains.add(env['PRIMARY_HOSTNAME'])
 
 	# Also serve web for all mail domains so that we might at least
-	# provide Webfinger and ActiveSync auto-discover of email settings
-	# (though the latter isn't really working). These will require that
-	# an SSL cert be installed.
+	# provide auto-discover of email settings, and also a static website
+	# if the user wants to make one. These will require an SSL cert.
 	domains |= get_mail_domains(env)
 
 	# ...Unless the domain has an A/AAAA record that maps it to a different
 	# IP address than this box. Remove those domains from our list.
 	dns = get_custom_dns_config(env)
-	for domain, value in dns.items():
+	for domain, rtype, value in dns:
 		if domain not in domains: continue
-		if (isinstance(value, str) and (value != "local")) \
-		  or (isinstance(value, dict) and ("A" in value) and (value["A"] != "local")) \
-		  or (isinstance(value, dict) and ("AAAA" in value) and (value["AAAA"] != "local")):
+		if rtype == "CNAME" or (rtype in ("A", "AAAA") and value != "local"):
 			domains.remove(domain)
 
 	# Sort the list. Put PRIMARY_HOSTNAME first so it becomes the
@@ -38,7 +35,7 @@ def get_web_domains(env):
 
 	return domains
 	
-def do_web_update(env, ok_status="web updated\n"):
+def do_web_update(env):
 	# Build an nginx configuration file.
 	nginx_conf = open(os.path.join(os.path.dirname(__file__), "../conf/nginx-top.conf")).read()
 
@@ -65,7 +62,7 @@ def do_web_update(env, ok_status="web updated\n"):
 	# enough and doesn't break any open connections.
 	shell('check_call', ["/usr/sbin/service", "nginx", "reload"])
 
-	return ok_status
+	return "web updated\n"
 
 def make_domain_config(domain, template, template_for_primaryhost, env):
 	# How will we configure this domain.
@@ -75,11 +72,11 @@ def make_domain_config(domain, template, template_for_primaryhost, env):
 	root = get_web_root(domain, env)
 
 	# What private key and SSL certificate will we use for this domain?
-	ssl_key, ssl_certificate, csr_path = get_domain_ssl_files(domain, env)
+	ssl_key, ssl_certificate, ssl_via = get_domain_ssl_files(domain, env)
 
 	# For hostnames created after the initial setup, ensure we have an SSL certificate
 	# available. Make a self-signed one now if one doesn't exist.
-	ensure_ssl_certificate_exists(domain, ssl_key, ssl_certificate, csr_path, env)
+	ensure_ssl_certificate_exists(domain, ssl_key, ssl_certificate, env)
 
 	# Put pieces together.
 	nginx_conf_parts = re.split("\s*# ADDITIONAL DIRECTIVES HERE\s*", template)
@@ -89,7 +86,7 @@ def make_domain_config(domain, template, template_for_primaryhost, env):
 
 	# Replace substitution strings in the template & return.
 	nginx_conf = nginx_conf.replace("$STORAGE_ROOT", env['STORAGE_ROOT'])
-	nginx_conf = nginx_conf.replace("$HOSTNAME", domain.encode("idna").decode("ascii"))
+	nginx_conf = nginx_conf.replace("$HOSTNAME", domain)
 	nginx_conf = nginx_conf.replace("$ROOT", root)
 	nginx_conf = nginx_conf.replace("$SSL_KEY", ssl_key)
 	nginx_conf = nginx_conf.replace("$SSL_CERTIFICATE", ssl_certificate)
@@ -149,6 +146,7 @@ def get_domain_ssl_files(domain, env, allow_shared_cert=True):
 
 	# What SSL certificate will we use?
 	ssl_certificate_primary = os.path.join(env["STORAGE_ROOT"], 'ssl/ssl_certificate.pem')
+	ssl_via = None
 	if domain == env['PRIMARY_HOSTNAME']:
 		# For PRIMARY_HOSTNAME, use the one we generated at set-up time.
 		ssl_certificate = ssl_certificate_primary
@@ -163,17 +161,18 @@ def get_domain_ssl_files(domain, env, allow_shared_cert=True):
 			from status_checks import check_certificate
 			if check_certificate(domain, ssl_certificate_primary, None)[0] == "OK":
 				ssl_certificate = ssl_certificate_primary
+				ssl_via = "Using multi/wildcard certificate of %s." % env['PRIMARY_HOSTNAME']
 
-	# Where would the CSR go? As with the SSL cert itself, the CSR must be
-	# different for each domain name.
-	if domain == env['PRIMARY_HOSTNAME']:
-		csr_path = os.path.join(env["STORAGE_ROOT"], 'ssl/ssl_cert_sign_req.csr')
-	else:
-		csr_path = os.path.join(env["STORAGE_ROOT"], 'ssl/%s/certificate_signing_request.csr' % safe_domain_name(domain))
+			# For a 'www.' domain, see if we can reuse the cert of the parent.
+			elif domain.startswith('www.'):
+				ssl_certificate_parent = os.path.join(env["STORAGE_ROOT"], 'ssl/%s/ssl_certificate.pem' % safe_domain_name(domain[4:]))
+				if os.path.exists(ssl_certificate_parent) and check_certificate(domain, ssl_certificate_parent, None)[0] == "OK":
+					ssl_certificate = ssl_certificate_parent
+					ssl_via = "Using multi/wildcard certificate of %s." % domain[4:]
 
-	return ssl_key, ssl_certificate, csr_path
+	return ssl_key, ssl_certificate, ssl_via
 
-def ensure_ssl_certificate_exists(domain, ssl_key, ssl_certificate, csr_path, env):
+def ensure_ssl_certificate_exists(domain, ssl_key, ssl_certificate, env):
 	# For domains besides PRIMARY_HOSTNAME, generate a self-signed certificate if
 	# a certificate doesn't already exist. See setup/mail.sh for documentation.
 
@@ -192,25 +191,25 @@ def ensure_ssl_certificate_exists(domain, ssl_key, ssl_certificate, csr_path, en
 
 	# Generate a new self-signed certificate using the same private key that we already have.
 
-	# Start with a CSR.
-	with open(csr_path, "w") as f:
-		f.write(create_csr(domain, ssl_key, env))
+	# Start with a CSR written to a temporary file.
+	with tempfile.NamedTemporaryFile(mode="w") as csr_fp:
+		csr_fp.write(create_csr(domain, ssl_key, env))
+		csr_fp.flush() # since we won't close until after running 'openssl x509', since close triggers delete.
 
-	# And then make the certificate.
-	shell("check_call", [
-		"openssl", "x509", "-req",
-		"-days", "365",
-		"-in", csr_path,
-		"-signkey", ssl_key,
-		"-out", ssl_certificate])
+		# And then make the certificate.
+		shell("check_call", [
+			"openssl", "x509", "-req",
+			"-days", "365",
+			"-in", csr_fp.name,
+			"-signkey", ssl_key,
+			"-out", ssl_certificate])
 
 def create_csr(domain, ssl_key, env):
 	return shell("check_output", [
                 "openssl", "req", "-new",
                 "-key", ssl_key,
-                "-out",  "/dev/stdout",
                 "-sha256",
-                "-subj", "/C=%s/ST=/L=/O=/CN=%s" % (env["CSR_COUNTRY"], domain.encode("idna").decode("ascii"))])
+                "-subj", "/C=%s/ST=/L=/O=/CN=%s" % (env["CSR_COUNTRY"], domain)])
 
 def install_cert(domain, ssl_cert, ssl_chain, env):
 	if domain not in get_web_domains(env):
@@ -225,7 +224,7 @@ def install_cert(domain, ssl_cert, ssl_chain, env):
 
 	# Do validation on the certificate before installing it.
 	from status_checks import check_certificate
-	ssl_key, ssl_certificate, ssl_csr_path = get_domain_ssl_files(domain, env, allow_shared_cert=False)
+	ssl_key, ssl_certificate, ssl_via = get_domain_ssl_files(domain, env, allow_shared_cert=False)
 	cert_status, cert_status_details = check_certificate(domain, fn, ssl_key)
 	if cert_status != "OK":
 		if cert_status == "SELF-SIGNED":
@@ -239,7 +238,7 @@ def install_cert(domain, ssl_cert, ssl_chain, env):
 	os.makedirs(os.path.dirname(ssl_certificate), exist_ok=True)
 	shutil.move(fn, ssl_certificate)
 
-	ret = []
+	ret = ["OK"]
 
 	# When updating the cert for PRIMARY_HOSTNAME, also update DNS because it is
 	# used in the DANE TLSA record and restart postfix and dovecot which use
@@ -252,22 +251,32 @@ def install_cert(domain, ssl_cert, ssl_chain, env):
 		ret.append("mail services restarted")
 
 	# Kick nginx so it sees the cert.
-	ret.append( do_web_update(env, ok_status="") )
-	return "\n".join(r for r in ret if r.strip() != "")
+	ret.append( do_web_update(env) )
+	return "\n".join(ret)
 
 def get_web_domains_info(env):
+	# load custom settings so we can tell what domains have a redirect or proxy set up on '/',
+	# which means static hosting is not happening
+	custom_settings = { }
+	nginx_conf_custom_fn = os.path.join(env["STORAGE_ROOT"], "www/custom.yaml")
+	if os.path.exists(nginx_conf_custom_fn):
+		custom_settings = rtyaml.load(open(nginx_conf_custom_fn))
+	def has_root_proxy_or_redirect(domain):
+		return custom_settings.get(domain, {}).get('redirects', {}).get('/') or custom_settings.get(domain, {}).get('proxies', {}).get('/')
+
+	# for the SSL config panel, get cert status
 	def check_cert(domain):
 		from status_checks import check_certificate
-		ssl_key, ssl_certificate, ssl_csr_path = get_domain_ssl_files(domain, env)
+		ssl_key, ssl_certificate, ssl_via = get_domain_ssl_files(domain, env)
 		if not os.path.exists(ssl_certificate):
 			return ("danger", "No Certificate Installed")
 		cert_status, cert_status_details = check_certificate(domain, ssl_certificate, ssl_key)
 		if cert_status == "OK":
-			if domain == env['PRIMARY_HOSTNAME'] or ssl_certificate != get_domain_ssl_files(env['PRIMARY_HOSTNAME'], env)[1]:
+			if not ssl_via:
 				return ("success", "Signed & valid. " + cert_status_details)
 			else:
 				# This is an alternate domain but using the same cert as the primary domain.
-				return ("success", "Signed & valid. Using multi/wildcard certificate of %s." % env['PRIMARY_HOSTNAME'])
+				return ("success", "Signed & valid. " + ssl_via)
 		elif cert_status == "SELF-SIGNED":
 			return ("warning", "Self-signed. Get a signed certificate to stop warnings.")
 		else:
@@ -279,6 +288,7 @@ def get_web_domains_info(env):
 			"root": get_web_root(domain, env),
 			"custom_root": get_web_root(domain, env, test_exists=False),
 			"ssl_certificate": check_cert(domain),
+			"static_enabled": not has_root_proxy_or_redirect(domain),
 		}
 		for domain in get_web_domains(env)
 	]

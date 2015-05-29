@@ -1,24 +1,116 @@
 CHANGELOG
 =========
 
-Development
------------
+In Development
+--------------
+
+* ownCloud updated to version 8.0.3.
+* SMTP Submission (port 587) began offering the insecure SSLv3 protocol due to a misconfiguration in the previous version.
+* Users and aliases weren't working if they were entered with any uppercase letters. Now only lowercase is allowed.
+* Fix broken install on OVH VPS's.
+* After installing an SSL certificate from the control panel, the page wasn't being refreshed.
+* The minimum greylisting delay has been reduced from 5 minutes to 3 minutes.
+
+v0.09 (May 8, 2015)
+-------------------
+
+Mail:
+
+* Spam checking is now performed on messages larger than the previous limit of 64KB.
+* POP3S is now enabled (port 995).
+* Roundcube is updated to version 1.1.1.
+* Minor security improvements (more mail headers with user agent info are anonymized; crypto settings were tightened).
+
+ownCloud:
+
+* Downloading files you uploaded to ownCloud broke because of a change in ownCloud 8.
+
+DNS:
+
+* Internationalized Domain Names (IDNs) should now work in email. If you had custom DNS or custom web settings for internationalized domains, check that they are still working.
+* It is now possible to set multiple TXT and other types of records on the same domain in the control panel.
+* The custom DNS API was completely rewritten to support setting multiple records of the same type on a domain. Any existing client code using the DNS API will have to be rewritten. (Existing code will just get 404s back.)
+* On some systems the `nsd` service failed to start if network inferfaces were not ready.
+
+System / Control Panel:
+
+* In order to guard against misconfiguration that can lead to domain control validation hijacking, email addresses that begin with admin, administrator, postmaster, hostmaster, and webmaster can no longer be used for (new) mail user accounts, and aliases for these addresses may direct mail only to the box's administrator(s).
+* Backups now use duplicity's built-in gpg symmetric AES256 encryption rather than my home-brewed encryption. Old backups will be incorporated inside the first backup after this update but then deleted from disk (i.e. your backups from the previous few days will be backed up).
+* There was a race condition between backups and the new nightly status checks.
+* The control panel would sometimes lock up with an unnecessary loading indicator.
+* You can no longer delete your own account from the control panel.
+
+Setup:
+
+* All Mail-in-a-Box release tags are now signed on github, instructions for verifying the signature are added to the README, and the integrity of some packages downloaded during setup is now verified against a SHA1 hash stored in the tag itself.
+* Bugs in first user account creation were fixed.
+
+v0.08 (April 1, 2015)
+---------------------
+
+Mail:
+
+* The Roundcube vacation_sieve plugin by @arodier is now installed to make it easier to set vacation auto-reply messages from within Roundcube.
+* Authentication-Results headers for DMARC, added in v0.07, were mistakenly added for outbound mail --- that's now removed.
+* The Trash folder is now created automatically for new mail accounts, addressing a Roundcube error.
+
+DNS:
+
+* Custom DNS TXT records were not always working and they can now override the default SPF, DKIM, and DMARC records.
+
+System:
+
+* ownCloud updated to version 8.0.2.
+* Brute-force SSH and IMAP login attempts are now prevented by properly configuring fail2ban.
+* Status checks are run each night and any changes from night to night are emailed to the box administrator (the first user account).
+
+Control panel:
+
+* The new check that system services are running mistakenly checked that the Dovecot Managesieve service is publicly accessible. Although the service binds to the public network interface we don't open the port in ufw. On some machines it seems that ufw blocks the connection from the status checks (which seems correct) and on some machines (mine) it doesn't, which is why I didn't notice the problem.
+* The current backup chain will now try to predict how many days until it is deleted (always at least 3 days after the next full backup).
+* The list of aliases that forward to a user are removed from the Mail Users page because when there are many alises it is slow and times-out.
+* Some status check errors are turned into warnings, especially those that might not apply if External DNS is used.
+
+v0.07 (February 28, 2015)
+-------------------------
+
+Mail:
+
+* If the box manages mail for a domain and a subdomain of that domain, outbound mail from the subdomain was not DKIM-signed and would therefore fail DMARC tests on the receiving end, possibly result in the mail heading into spam folders.
+* Auto-configuration for Mozilla Thunderbird, Evolution, KMail, and Kontact is now available.
+* Domains that only have a catch-all alias or domain alias no longer automatically create/require admin@ and postmaster@ addresses since they'll forward anyway.
+* Roundcube is updated to version 1.1.0.
+* Authentication-Results headers for DMARC are now added to incoming mail.
+
+DNS:
+
+* If a custom CNAME record is set on a 'www' subdomain, the default A/AAAA records were preventing the CNAME from working.
+* If a custom DNS A record overrides one provided by the box, the a corresponding default IPv6 record by the box is removed since it will probably be incorrect.
+* Internationalized domain names (IDNs) are now supported for DNS and web, but email is not yet tested.
+
+Web:
+
+* Static websites now deny access to certain dot (.) files and directories which typically have sensitive info: .ht*, .svn*, .git*, .hg*, .bzr*.
+* The nginx server no longer reports its version and OS for better privacy.
+* The HTTP->HTTPS redirect is now more efficient.
+* When serving a 'www.' domain, reuse the SSL certificate for the parent domain if it covers the 'www' subdomain too
+* If a custom DNS CNAME record is set on a domain, don't offer to put a website on that domain. (Same logic already applies to custom A/AAAA records.)
 
 Control panel:
 
 * Status checks now check that system services are actually running by pinging each port that should have something running on it.
-* If a custom CNAME record is set on a 'www' subdomain, the default A/AAAA records were preventing the CNAME from working.
+* The status checks are now parallelized so they may be a little faster.
+* The status check for MX records now allow any priority, in case an unusual setup is required.
+* The interface for setting website domain-specific directories is simplified.
+* The mail guide now says that to use Outlook, Outlook 2007 or later on Windows 7 and later is required.
+* External DNS settings now skip the special "_secondary_nameserver" key which is used for storing secondary NS information.
 
 Setup:
 
 * Install cron if it isn't already installed.
 * Fix a units problem in the minimum memory check.
-
-Miscellaneous:
-
-* Internationalized domain names (IDNs) are now supported for DNS and web, but email is not yet tested.
-* Domains that only have a catch-all alias or domain alias no longer automatically create/require admin@ and postmaster@ addresses since they'll forward anyway.
-
+* If you override the STORAGE_ROOT, your setting will now persist if you re-run setup.
+* Hangs due to apt wanting the user to resolve a conflict should now be fixed (apt will just clobber the problematic file now).
 
 v0.06 (January 4, 2015)
 -----------------------

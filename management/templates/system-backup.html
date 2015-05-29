@@ -11,11 +11,11 @@
 
 <p>Many cloud providers make this easy by allowing you to take snapshots of the machine's disk.</p>
 
-<p>You can also use SFTP (FTP over SSH) to copy files from <tt id="backup-location"></tt>. These files are encrpyted, so they are safe to store anywhere. Copy the encryption password from <tt id="backup-encpassword-file"></tt> also but keep it in a safe location.</p>
+<p>You can also use SFTP (FTP over SSH) to copy files from <tt id="backup-location"></tt>. These files are encrypted, so they are safe to store anywhere. Copy the encryption password from <tt id="backup-encpassword-file"></tt> also but keep it in a safe location.</p>
 
 <h3>Current Backups</h3>
 
-<p>The backup directory currently contains the backups listed below. The total size on disk of the backups is <span id="backup-total-size"></span>.</p>
+<p>The backup directory currently contains the backups listed below. The total size on disk of the backups is currently <span id="backup-total-size"></span>.</p>
 
 <table id="backup-status" class="table" style="width: auto">
   <thead>
@@ -27,8 +27,6 @@
   <tbody>
   </tbody>
 </table>
-
-<p style="margin-top: 2em"><small>The size column in the table indicates the size of the encrpyted backup, but the total size on disk shown above includes storage for unencrpyted intermediate files.</small></p>
 
 <script>
 function nice_size(bytes) {
@@ -54,7 +52,7 @@ function show_system_backup() {
     "GET",
     { },
     function(r) {
-      $('#backup-location').text(r.encdirectory);
+      $('#backup-location').text(r.directory);
       $('#backup-encpassword-file').text(r.encpwfile);
 
       $('#backup-status tbody').html("");
@@ -72,15 +70,14 @@ function show_system_backup() {
         tr.append( $('<td/>').text(b.date_str + " " + r.tz) );
         tr.append( $('<td/>').text(b.date_delta + " ago") );
         tr.append( $('<td/>').text(b.full ? "full" : "increment") );
-        tr.append( $('<td style="text-align: right"/>').text( nice_size(b.encsize)) );
+        tr.append( $('<td style="text-align: right"/>').text( nice_size(b.size)) );
         if (b.deleted_in)
           tr.append( $('<td/>').text(b.deleted_in) );
         else
-          tr.append( $('<td class="text-muted">n/a</td>') );
+          tr.append( $('<td class="text-muted">unknown</td>') );
         $('#backup-status tbody').append(tr);
 
         total_disk_size += b.size;
-        total_disk_size += b.encsize;
       }
 
       $('#backup-total-size').text(nice_size(total_disk_size));

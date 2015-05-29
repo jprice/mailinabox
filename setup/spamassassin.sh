@@ -25,10 +25,14 @@ tools/editconf.py /etc/default/spamassassin \
 # Configure pyzor.
 hide_output pyzor discover
 
-# Pass messages on to docevot on port 10026.
-# This is actually the default setting but we don't want to lose track of it.
-# We've already configured Dovecot to listen on this port.
-tools/editconf.py /etc/default/spampd DESTPORT=10026
+# Configure spampd:
+# * Pass messages on to docevot on port 10026. This is actually the default setting but we don't
+#   want to lose track of it. (We've configured Dovecot to listen on this port elsewhere.)
+# * Increase the maximum message size of scanned messages from the default of 64KB to 500KB, which
+#   is Spamassassin (spamc)'s own default. Specified in KBytes.
+tools/editconf.py /etc/default/spampd \
+	DESTPORT=10026 \
+	ADDOPTS="\"--maxsize=500\""
 
 # Spamassassin normally wraps spam as an attachment inside a fresh
 # email with a report about the message. This also protects the user
@@ -71,6 +75,7 @@ chown -R spampd:spampd $STORAGE_ROOT/mail/spamassassin
 # Enable the Dovecot antispam plugin.
 # (Be careful if we use multiple plugins later.) #NODOC
 sed -i "s/#mail_plugins = .*/mail_plugins = \$mail_plugins antispam/" /etc/dovecot/conf.d/20-imap.conf
+sed -i "s/#mail_plugins = .*/mail_plugins = \$mail_plugins antispam/" /etc/dovecot/conf.d/20-pop3.conf
 
 # Configure the antispam plugin to call sa-learn-pipe.sh.
 cat > /etc/dovecot/conf.d/99-local-spampd.conf << EOF;

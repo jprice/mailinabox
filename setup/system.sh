@@ -9,7 +9,7 @@ source setup/functions.sh # load our functions
 
 echo Updating system packages...
 hide_output apt-get update
-hide_output apt-get -y upgrade
+apt_get_quiet upgrade
 
 # Install basic utilities.
 #
@@ -20,12 +20,13 @@ hide_output apt-get -y upgrade
 # * cron: Runs background processes periodically.
 # * ntp: keeps the system time correct
 # * fail2ban: scans log files for repeated failed login attempts and blocks the remote IP at the firewall
+# * git: we install some things directly from github
 # * sudo: allows privileged users to execute commands as root without being root
 # * coreutils: includes `nproc` tool to report number of processors
 # * bc: allows us to do math to compute sane defaults
 
 apt_install python3 python3-dev python3-pip \
-	wget curl sudo coreutils bc \
+	wget curl git sudo coreutils bc \
 	haveged unattended-upgrades cron ntp fail2ban
 
 # Allow apt to install system updates automatically every day.
@@ -106,3 +107,11 @@ fi
 
 restart_service bind9
 restart_service resolvconf
+
+# ### Fail2Ban Service
+
+# Configure the Fail2Ban installation to prevent dumb bruce-force attacks against dovecot, postfix and ssh
+cp conf/fail2ban/jail.local /etc/fail2ban/jail.local
+cp conf/fail2ban/dovecotimap.conf /etc/fail2ban/filter.d/dovecotimap.conf
+
+restart_service fail2ban
