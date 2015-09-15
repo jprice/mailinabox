@@ -19,9 +19,10 @@ source /etc/mailinabox.conf # load global vars
 # and then we'll manually install roundcube from source.
 
 # These dependencies are from `apt-cache showpkg roundcube-core`.
+echo "Installing Roundcube (webmail)..."
 apt_install \
 	dbconfig-common \
-	php5 php5-sqlite php5-mcrypt php5-intl php5-json php5-common php-auth php-net-smtp php-net-socket php-net-sieve php-mail-mime php-crypt-gpg php5-gd php5-pspell \
+	php5 php5-sqlite php5-mcrypt php5-intl php5-json php5-common php-auth php-net-smtp php-net-socket php-net-sieve php-mail-mime php-mail-mimedecode php-crypt-gpg php5-gd php5-pspell \
 	tinymce libjs-jquery libjs-jquery-mousewheel libmagic1
 
 # We used to install Roundcube from Ubuntu, without triggering the dependencies #NODOC
@@ -32,22 +33,23 @@ apt-get purge -qq -y roundcube* #NODOC
 # Install Roundcube from source if it is not already present or if it is out of date.
 # Combine the Roundcube version number with the commit hash of vacation_sieve to track
 # whether we have the latest version.
-VERSION=1.1.1
-HASH=08222f382a8dd89bba7dbbad595f48443bec0aa2
+VERSION=1.1.2
+HASH=df88deae691da3ecf3e9f0aee674c1f3042ea1eb
 VACATION_SIEVE_VERSION=91ea6f52216390073d1f5b70b5f6bea0bfaee7e5
+PERSISTENT_LOGIN_VERSION=117fbd8f93b56b2bf72ad055193464803ef3bc36
+UPDATE_KEY=$VERSION:$VACATION_SIEVE_VERSION:$PERSISTENT_LOGIN_VERSION
 needs_update=0 #NODOC
 if [ ! -f /usr/local/lib/roundcubemail/version ]; then
 	# not installed yet #NODOC
 	needs_update=1 #NODOC
-elif [[ "$VERSION:$VACATION_SIEVE_VERSION" != `cat /usr/local/lib/roundcubemail/version` ]]; then
+elif [[ "$UPDATE_KEY" != `cat /usr/local/lib/roundcubemail/version` ]]; then
 	# checks if the version is what we want
 	needs_update=1 #NODOC
 fi
 if [ $needs_update == 1 ]; then
 	# install roundcube
-	echo installing Roundcube webmail $VERSION...
 	wget_verify \
-		http://downloads.sourceforge.net/project/roundcubemail/roundcubemail/$VERSION/roundcubemail-$VERSION.tar.gz \
+		https://mailinabox.email/mirror/roundcubemail-$VERSION.tar.gz \
 		$HASH \
 		/tmp/roundcube.tgz
 	tar -C /usr/local/lib -zxf /tmp/roundcube.tgz
@@ -58,8 +60,11 @@ if [ $needs_update == 1 ]; then
 	# install roundcube autoreply/vacation plugin
 	git_clone https://github.com/arodier/Roundcube-Plugins.git $VACATION_SIEVE_VERSION plugins/vacation_sieve /usr/local/lib/roundcubemail/plugins/vacation_sieve
 
+	# install roundcube persistent_login plugin
+	git_clone https://github.com/mfreiholz/Roundcube-Persistent-Login-Plugin.git $PERSISTENT_LOGIN_VERSION '' /usr/local/lib/roundcubemail/plugins/persistent_login
+
 	# record the version we've installed
-	echo $VERSION:$VACATION_SIEVE_VERSION > /usr/local/lib/roundcubemail/version
+	echo $UPDATE_KEY > /usr/local/lib/roundcubemail/version
 fi
 
 # ### Configuring Roundcube
@@ -91,7 +96,7 @@ cat > /usr/local/lib/roundcubemail/config/config.inc.php <<EOF;
 \$config['support_url'] = 'https://mailinabox.email/';
 \$config['product_name'] = 'Mail-in-a-Box/Roundcube Webmail';
 \$config['des_key'] = '$SECRET_KEY';
-\$config['plugins'] = array('archive', 'zipdownload', 'password', 'managesieve', 'jqueryui', 'vacation_sieve');
+\$config['plugins'] = array('archive', 'zipdownload', 'password', 'managesieve', 'jqueryui', 'vacation_sieve', 'persistent_login');
 \$config['skin'] = 'classic';
 \$config['login_autocomplete'] = 2;
 \$config['password_charset'] = 'UTF-8';

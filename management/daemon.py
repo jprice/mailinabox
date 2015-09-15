@@ -4,7 +4,7 @@ import os, os.path, re, json
 
 from functools import wraps
 
-from flask import Flask, request, render_template, abort, Response
+from flask import Flask, request, render_template, abort, Response, send_from_directory
 
 import auth, utils
 from mailconfig import get_mail_users, get_mail_users_ex, get_admins, add_mail_user, set_mail_password, remove_mail_user
@@ -45,7 +45,7 @@ def authorized_personnel_only(viewfunc):
 
 		# Authorized to access an API view?
 		if "admin" in privs:
-			# Call view func.	
+			# Call view func.
 			return viewfunc(*args, **kwargs)
 		elif not error:
 			error = "You are not an administrator."
@@ -90,13 +90,19 @@ def json_response(data):
 def index():
 	# Render the control panel. This route does not require user authentication
 	# so it must be safe!
+
 	no_users_exist = (len(get_mail_users(env)) == 0)
 	no_admins_exist = (len(get_admins(env)) == 0)
+
+	import boto.s3
+	backup_s3_hosts = [(r.name, r.endpoint) for r in boto.s3.regions()]
+
 	return render_template('index.html',
 		hostname=env['PRIMARY_HOSTNAME'],
 		storage_root=env['STORAGE_ROOT'],
 		no_users_exist=no_users_exist,
 		no_admins_exist=no_admins_exist,
+		backup_s3_hosts=backup_s3_hosts,
 	)
 
 @app.route('/me')
@@ -118,7 +124,7 @@ def me():
 
 	# Is authorized as admin? Return an API key for future use.
 	if "admin" in privs:
-		resp["api_key"] = auth_service.create_user_key(email)
+		resp["api_key"] = auth_service.create_user_key(email, env)
 
 	# Return.
 	return json_response(resp)
@@ -179,14 +185,15 @@ def mail_aliases():
 	if request.args.get("format", "") == "json":
 		return json_response(get_mail_aliases_ex(env))
 	else:
-		return "".join(x+"\t"+y+"\n" for x, y in get_mail_aliases(env))
+		return "".join(address+"\t"+receivers+"\t"+(senders or "")+"\n" for address, receivers, senders in get_mail_aliases(env))
 
 @app.route('/mail/aliases/add', methods=['POST'])
 @authorized_personnel_only
 def mail_aliases_add():
 	return add_mail_alias(
-		request.form.get('source', ''),
-		request.form.get('destination', ''),
+		request.form.get('address', ''),
+		request.form.get('forwards_to', ''),
+		request.form.get('permitted_senders', ''),
 		env,
 		update_if_exists=(request.form.get('update_if_exists', '') == '1')
 		)
@@ -194,7 +201,7 @@ def mail_aliases_add():
 @app.route('/mail/aliases/remove', methods=['POST'])
 @authorized_personnel_only
 def mail_aliases_remove():
-	return remove_mail_alias(request.form.get('source', ''), env)
+	return remove_mail_alias(request.form.get('address', ''), env)
 
 @app.route('/mail/domains')
 @authorized_personnel_only
@@ -222,14 +229,14 @@ def dns_update():
 @authorized_personnel_only
 def dns_get_secondary_nameserver():
 	from dns_update import get_custom_dns_config, get_secondary_dns
-	return json_response({ "hostname": get_secondary_dns(get_custom_dns_config(env)) })
+	return json_response({ "hostnames": get_secondary_dns(get_custom_dns_config(env), mode=None) })
 
 @app.route('/dns/secondary-nameserver', methods=['POST'])
 @authorized_personnel_only
 def dns_set_secondary_nameserver():
 	from dns_update import set_secondary_dns
 	try:
-		return set_secondary_dns(request.form.get('hostname'), env)
+		return set_secondary_dns([ns.strip() for ns in re.split(r"[, ]+", request.form.get('hostnames') or "") if ns.strip() != ""], env)
 	except ValueError as e:
 		return (str(e), 400)
 
@@ -283,7 +290,7 @@ def dns_set_record(qname, rtype="A"):
 				# make this action set (replace all records for this
 				# qname-rtype pair) rather than add (add a new record).
 				action = "set"
-		
+
 		elif request.method == "DELETE":
 			if value == '':
 				# Delete all records for this qname-type pair.
@@ -340,6 +347,24 @@ def web_update():
 
 # System
 
+@app.route('/system/version', methods=["GET"])
+@authorized_personnel_only
+def system_version():
+	from status_checks import what_version_is_this
+	try:
+		return what_version_is_this(env)
+	except Exception as e:
+		return (str(e), 500)
+
+@app.route('/system/latest-upstream-version', methods=["POST"])
+@authorized_personnel_only
+def system_latest_upstream_version():
+	from status_checks import get_latest_miab_version
+	try:
+		return get_latest_miab_version()
+	except Exception as e:
+		return (str(e), 500)
+
 @app.route('/system/status', methods=["POST"])
 @authorized_personnel_only
 def system_status():
@@ -384,6 +409,48 @@ def backup_status():
 	from backup import backup_status
 	return json_response(backup_status(env))
 
+@app.route('/system/backup/config', methods=["GET"])
+@authorized_personnel_only
+def backup_get_custom():
+	from backup import get_backup_config
+	return json_response(get_backup_config(env, for_ui=True))
+
+@app.route('/system/backup/config', methods=["POST"])
+@authorized_personnel_only
+def backup_set_custom():
+	from backup import backup_set_custom
+	return json_response(backup_set_custom(env,
+		request.form.get('target', ''),
+		request.form.get('target_user', ''),
+		request.form.get('target_pass', ''),
+		request.form.get('min_age', '')
+	))
+
+@app.route('/system/privacy', methods=["GET"])
+@authorized_personnel_only
+def privacy_status_get():
+	config = utils.load_settings(env)
+	return json_response(config.get("privacy", True))
+
+@app.route('/system/privacy', methods=["POST"])
+@authorized_personnel_only
+def privacy_status_set():
+	config = utils.load_settings(env)
+	config["privacy"] = (request.form.get('value') == "private")
+	utils.write_settings(config, env)
+	return "OK"
+
+# MUNIN
+
+@app.route('/munin/')
+@app.route('/munin/<path:filename>')
+@authorized_personnel_only
+def munin(filename=""):
+	# Checks administrative access (@authorized_personnel_only) and then just proxies
+	# the request to static files.
+	if filename == "": filename = "index.html"
+	return send_from_directory("/var/cache/munin/www", filename)
+
 # APP
 
 if __name__ == '__main__':
@@ -403,4 +470,3 @@ if __name__ == '__main__':
 
 	# Start the application server. Listens on 127.0.0.1 (IPv4 only).
 	app.run(port=10222)
-

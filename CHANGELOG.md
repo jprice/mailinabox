@@ -4,12 +4,145 @@ CHANGELOG
 In Development
 --------------
 
-* ownCloud updated to version 8.0.3.
+Mail:
+
+* Spamassassin's network-based tests (Pyzor, others) and DKIM tests are now enabled. (Pyzor had always been installed but was not active due to a misconfiguration.)
+* Moving spam out of the Spam folder and into Trash would incorrectly train Spamassassin that those messages were not spam.
+
+Calender/Contacts:
+
+* CalDAV/CardDAV and Exchange/ActiveSync for calendar/contacts wasn't working in some network configurations.
+
+Web:
+
+* If a custom DNS record is set on a domain or 'www'+domain, web would not be served for that domain. If the custom DNS record is just the box's IP address, that's a configuration mistake, but allow it and let web continue to be served.
+* Accommodate really long domain names by increasing an nginx setting.
+
+Control panel:
+
+* Added an option to check for new Mail-in-a-Box versions within status checks. It is off by default so that boxes don't "phone home" without permission.
+* Added a random password generator on the users page to simplify creating new accounts.
+* When S3 backup credentials are set, the credentials are now no longer ever sent back from the box to the client, for better security.
+* Fixed the jumpiness when a modal is displayed.
+* Focus is put into the login form fields when the login form is displayed.
+* Status checks now include a warning if a custom DNS record has been set on a domain that would normally serve web and as a result that domain no longer is serving web.
+* Some errors in the control panel when there is invalid data in the database or an improperly named archived user account have been suppressed.
+
+v0.13b (August 30, 2015)
+------------------------
+
+Another ownCloud 8.1.1 issue was found. New installations left ownCloud improperly setup ("You are accessing the server from an untrusted domain."). Upgrading to this version will fix that.
+
+v0.13a (August 23, 2015)
+------------------------
+
+Note: v0.13 (no 'a', August 19, 2015) was pulled immediately due to an ownCloud bug that prevented upgrades. v0.13a works around that problem.
+
+Mail:
+
+* Outbound mail headers (the Recieved: header) are tweaked to possibly improve deliverability.
+* Some MIME messages would hang Roundcube due to a missing package.
+* The users permitted to send as an alias can now be different from where an alias forwards to.
+
+DNS:
+
+* The secondary nameservers option in the control panel now accepts more than one nameserver and a special xfr:IP format to specify zone-transfer-only IP addresses.
+* A TLSA record is added for HTTPS for DNSSEC-aware clients that support it.
+
+System:
+
+* Backups can now be turned off, or stored in Amazon S3, through new control panel options.
+* Munin was not working on machines confused about their hostname and had lots of errors related to PANGO, NTP peers and network interfaces that were not up.
+* ownCloud updated to version 8.1.1 (with upgrade work-around), its memcached caching enabled.
+* When upgrading, network checks like blocked port 25 are now skipped.
+* Tweaks to the intrusion detection rules for IMAP.
+* Mail-in-a-Box's setup is a lot quieter, hiding lots of irrelevant messages.
+
+Control panel:
+
+* SSL certificate checks were failing on OVH/OpenVZ servers due to missing /dev/stdin.
+* Improve the sort order of the domains in the status checks.
+* Some links in the control panel were only working in Chrome.
+
+v0.12c (July 19, 2015)
+----------------------
+
+v0.12c was posted to work around the current Sourceforge.net outage: pyzor's remote server is now hard-coded rather than accessing a file hosted on Sourceforge, and roundcube is now downloaded from a Mail-in-a-Box mirror rather than from Sourceforge.
+
+v0.12b (July 4, 2015)
+---------------------
+
+This version corrects a minor regression in v0.12 related to creating aliases targetting multiple addresses.
+
+v0.12 (July 3, 2015)
+--------------------
+
+This is a minor update to v0.11, which was a major update. Please read v0.11's advisories.
+
+* The administrator@ alias was incorrectly created starting with v0.11. If your first install was v0.11, check that the administrator@ alias forwards mail to you.
+* Intrusion detection rules (fail2ban) are relaxed (i.e. less is blocked).
+* SSL certificates could not be installed for the new automatic 'www.' redirect domains.
+* PHP's default character encoding is changed from no default to UTF8. The effect of this change is unclear but should prevent possible future text conversion issues.
+* User-installed SSL private keys in the BEGIN PRIVATE KEY format were not accepted.
+* SSL certificates with SAN domains with IDNA encoding were broken in v0.11.
+* Some IDNA functionality was using IDNA 2003 rather than IDNA 2008.
+
+v0.11b (June 29, 2015)
+----------------------
+
+v0.11b was posted shortly after the initial posting of v0.11 to correct a missing dependency for the new PPA.
+
+v0.11 (June 29, 2015)
+---------------------
+
+Advisories:
+* Users can no longer spoof arbitrary email addresses in outbound mail. When sending mail, the email address configured in your mail client must match the SMTP login username being used, or the email address must be an alias with the SMTP login username listed as one of the alias's targets.
+* This update replaces your DKIM signing key with a stronger key. Because of DNS caching/propagation, mail sent within a few hours after this update could be marked as spam by recipients. If you use External DNS, you will need to update your DNS records.
+* The box will now install software from a new Mail-in-a-Box PPA on Launchpad.net, where we are distributing two of our own packages: a patched postgrey and dovecot-lucene.
+
+Mail:
+* Greylisting will now let some reputable senders pass through immediately.
+* Searching mail (via IMAP) will now be much faster using the dovecot lucene full text search plugin.
+* Users can no longer spoof arbitrary email addresses in outbound mail (see above).
+* Fix for deleting admin@ and postmaster@ addresses.
+* Roundcube is updated to version 1.1.2, plugins updated.
+* Exchange/ActiveSync autoconfiguration was not working on all devices (e.g. iPhone) because of a case-sensitive URL.
+* The DKIM signing key has been increased to 2048 bits, from 1024, replacing the existing key.
+
+Web:
+* 'www' subdomains now automatically redirect to their parent domain (but you'll need to install an SSL certificate).
+* OCSP no longer uses Google Public DNS.
+* The installed PHP version is no longer exposed through HTTP response headers, for better security.
+
+DNS:
+* Default IPv6 AAAA records were missing since version 0.09.
+
+Control panel:
+* Resetting a user's password now forces them to log in again everywhere.
+* Status checks were not working if an ssh server was not installed.
+* SSL certificate validation now uses the Python cryptography module in some places where openssl was used.
+* There is a new tab to show the installed version of Mail-in-a-Box and to fetch the latest released version.
+
+System:
+* The munin system monitoring tool is now installed and accessible at /admin/munin.
+* ownCloud updated to version 8.0.4. The ownCloud installation step now is reslient to download problems. The ownCloud configuration file is now stored in STORAGE_ROOT to fix loss of data when moving STORAGE_ROOT to a new machine.
+* The setup scripts now run `apt-get update` prior to installing anything to ensure the apt database is in sync with the packages actually available.
+
+
+v0.10 (June 1, 2015)
+--------------------
+
 * SMTP Submission (port 587) began offering the insecure SSLv3 protocol due to a misconfiguration in the previous version.
-* Users and aliases weren't working if they were entered with any uppercase letters. Now only lowercase is allowed.
-* Fix broken install on OVH VPS's.
-* After installing an SSL certificate from the control panel, the page wasn't being refreshed.
+* Roundcube now allows persistent logins using Roundcube-Persistent-Login-Plugin.
+* ownCloud is updated to version 8.0.3.
+* SPF records for non-mail domains were tightened.
 * The minimum greylisting delay has been reduced from 5 minutes to 3 minutes.
+* Users and aliases weren't working if they were entered with any uppercase letters. Now only lowercase is allowed.
+* After installing an SSL certificate from the control panel, the page wasn't being refreshed.
+* Backups broke if the box's hostname was changed after installation.
+* Dotfiles (i.e. .svn) stored in ownCloud Files were not accessible from ownCloud's mobile/desktop clients.
+* Fix broken install on OVH VPS's.
+
 
 v0.09 (May 8, 2015)
 -------------------

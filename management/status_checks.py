@@ -10,12 +10,13 @@ import sys, os, os.path, re, subprocess, datetime, multiprocessing.pool
 
 import dns.reversename, dns.resolver
 import dateutil.parser, dateutil.tz
+import idna
 
 from dns_update import get_dns_zones, build_tlsa_record, get_custom_dns_config, get_secondary_dns
-from web_update import get_web_domains, get_domain_ssl_files
+from web_update import get_web_domains, get_default_www_redirects, get_domain_ssl_files, get_domains_with_a_records
 from mailconfig import get_mail_domains, get_mail_aliases
 
-from utils import shell, sort_domains, load_env_vars_from_file
+from utils import shell, sort_domains, load_env_vars_from_file, load_settings
 
 def run_checks(rounded_values, env, output, pool):
 	# run systems checks
@@ -32,7 +33,7 @@ def run_checks(rounded_values, env, output, pool):
 	# (ignore errors; if bind9/rndc isn't running we'd already report
 	# that in run_services checks.)
 	shell('check_call', ["/usr/sbin/rndc", "flush"], trap=True)
-	
+
 	run_system_checks(rounded_values, env, output)
 
 	# perform other checks asynchronously
@@ -41,15 +42,22 @@ def run_checks(rounded_values, env, output, pool):
 	run_domain_checks(rounded_values, env, output, pool)
 
 def get_ssh_port():
-    # Returns ssh port
-    output = shell('check_output', ['sshd', '-T'])
-    returnNext = False
+	# Returns ssh port
+	try:
+		output = shell('check_output', ['sshd', '-T'])
+	except FileNotFoundError:
+		# sshd is not installed. That's ok.
+		return None
 
-    for e in output.split():
-        if returnNext:
-            return int(e)
-        if e == "port":
-            returnNext = True
+	returnNext = False
+	for e in output.split():
+		if returnNext:
+			return int(e)
+		if e == "port":
+			returnNext = True
+
+	# Did not find port!
+	return None
 
 def run_services_checks(env, output, pool):
 	# Check that system services are running.
@@ -81,6 +89,7 @@ def run_services_checks(env, output, pool):
 	fatal = False
 	ret = pool.starmap(check_service, ((i, service, env) for i, service in enumerate(services)), chunksize=1)
 	for i, running, fatal2, output2 in sorted(ret):
+		if output2 is None: continue # skip check (e.g. no port was set, e.g. no sshd)
 		all_running = all_running and running
 		fatal = fatal or fatal2
 		output2.playback(output)
@@ -91,6 +100,10 @@ def run_services_checks(env, output, pool):
 	return not fatal
 
 def check_service(i, service, env):
+	if not service["port"]:
+		# Skip check (no port, e.g. no sshd).
+		return (i, None, None, None)
+
 	import socket
 	output = BufferedOutput()
 	running = False
@@ -136,6 +149,7 @@ def check_service(i, service, env):
 def run_system_checks(rounded_values, env, output):
 	check_ssh_password(env, output)
 	check_software_updates(env, output)
+	check_miab_version(env, output)
 	check_system_aliases(env, output)
 	check_free_disk_space(rounded_values, env, output)
 
@@ -227,34 +241,43 @@ def run_domain_checks(rounded_time, env, output, pool):
 	dns_domains = set(dns_zonefiles)
 
 	# Get the list of domains we serve HTTPS for.
-	web_domains = set(get_web_domains(env))
+	web_domains = set(get_web_domains(env) + get_default_www_redirects(env))
 
 	domains_to_check = mail_domains | dns_domains | web_domains
+
+	# Get the list of domains that we don't serve web for because of a custom CNAME/A record.
+	domains_with_a_records = get_domains_with_a_records(env)
 
 	# Serial version:
 	#for domain in sort_domains(domains_to_check, env):
 	#	run_domain_checks_on_domain(domain, rounded_time, env, dns_domains, dns_zonefiles, mail_domains, web_domains)
 
 	# Parallelize the checks across a worker pool.
-	args = ((domain, rounded_time, env, dns_domains, dns_zonefiles, mail_domains, web_domains)
+	args = ((domain, rounded_time, env, dns_domains, dns_zonefiles, mail_domains, web_domains, domains_with_a_records)
 		for domain in domains_to_check)
 	ret = pool.starmap(run_domain_checks_on_domain, args, chunksize=1)
 	ret = dict(ret) # (domain, output) => { domain: output }
 	for domain in sort_domains(ret, env):
 		ret[domain].playback(output)
 
-def run_domain_checks_on_domain(domain, rounded_time, env, dns_domains, dns_zonefiles, mail_domains, web_domains):
+def run_domain_checks_on_domain(domain, rounded_time, env, dns_domains, dns_zonefiles, mail_domains, web_domains, domains_with_a_records):
 	output = BufferedOutput()
 
-	# The domain is IDNA-encoded, but for display use Unicode.
-	output.add_heading(domain.encode('ascii').decode('idna'))
+	# The domain is IDNA-encoded in the database, but for display use Unicode.
+	try:
+		domain_display = idna.decode(domain.encode('ascii'))
+		output.add_heading(domain_display)
+	except (ValueError, UnicodeError, idna.IDNAError) as e:
+		# Looks like we have some invalid data in our database.
+		output.add_heading(domain)
+		output.print_error("Domain name is invalid: " + str(e))
 
 	if domain == env["PRIMARY_HOSTNAME"]:
 		check_primary_hostname_dns(domain, env, output, dns_domains, dns_zonefiles)
-		
+
 	if domain in dns_domains:
 		check_dns_zone(domain, env, output, dns_zonefiles)
-		
+
 	if domain in mail_domains:
 		check_mail_domain(domain, env, output)
 
@@ -262,7 +285,7 @@ def run_domain_checks_on_domain(domain, rounded_time, env, dns_domains, dns_zone
 		check_web_domain(domain, rounded_time, env, output)
 
 	if domain in dns_domains:
-		check_dns_zone_suggestions(domain, env, output, dns_zonefiles)
+		check_dns_zone_suggestions(domain, env, output, dns_zonefiles, domains_with_a_records)
 
 	return (domain, output)
 
@@ -338,11 +361,14 @@ def check_primary_hostname_dns(domain, env, output, dns_domains, dns_zonefiles):
 	check_alias_exists("Hostmaster contact address", "hostmaster@" + domain, env, output)
 
 def check_alias_exists(alias_name, alias, env, output):
-	mail_alises = dict(get_mail_aliases(env))
-	if alias in mail_alises:
-		output.print_ok("%s exists as a mail alias. [%s ↦ %s]" % (alias_name, alias, mail_alises[alias]))
+	mail_aliases = dict([(address, receivers) for address, receivers, *_ in get_mail_aliases(env)])
+	if alias in mail_aliases:
+		if mail_aliases[alias]:
+			output.print_ok("%s exists as a mail alias. [%s ↦ %s]" % (alias_name, alias, mail_aliases[alias]))
+		else:
+			output.print_error("""You must set the destination of the mail alias for %s to direct email to you or another administrator.""" % alias)
 	else:
-		output.print_error("""You must add a mail alias for %s and direct email to you or another administrator.""" % alias)
+		output.print_error("""You must add a mail alias for %s which directs email to you or another administrator.""" % alias)
 
 def check_dns_zone(domain, env, output, dns_zonefiles):
 	# If a DS record is set at the registrar, check DNSSEC first because it will affect the NS query.
@@ -357,12 +383,9 @@ def check_dns_zone(domain, env, output, dns_zonefiles):
 	# the TLD, and so we're not actually checking the TLD. For that we'd need
 	# to do a DNS trace.
 	ip = query_dns(domain, "A")
-	secondary_ns = get_secondary_dns(get_custom_dns_config(env)) or "ns2." + env['PRIMARY_HOSTNAME']
+	secondary_ns = get_secondary_dns(get_custom_dns_config(env), mode="NS") or ["ns2." + env['PRIMARY_HOSTNAME']]
 	existing_ns = query_dns(domain, "NS")
-	correct_ns = "; ".join(sorted([
-		"ns1." + env['PRIMARY_HOSTNAME'],
-		secondary_ns,
-		]))
+	correct_ns = "; ".join(sorted(["ns1." + env['PRIMARY_HOSTNAME']] + secondary_ns))
 	if existing_ns.lower() == correct_ns.lower():
 		output.print_ok("Nameservers are set correctly at registrar. [%s]" % correct_ns)
 	elif ip == env['PUBLIC_IP']:
@@ -375,7 +398,14 @@ def check_dns_zone(domain, env, output, dns_zonefiles):
 			control panel to set the nameservers to %s."""
 				% (existing_ns, correct_ns) )
 
-def check_dns_zone_suggestions(domain, env, output, dns_zonefiles):
+def check_dns_zone_suggestions(domain, env, output, dns_zonefiles, domains_with_a_records):
+	# Warn if a custom DNS record is preventing this or the automatic www redirect from
+	# being served.
+	if domain in domains_with_a_records:
+		output.print_warning("""Web has been disabled for this domain because you have set a custom DNS record.""")
+	if "www." + domain in domains_with_a_records:
+		output.print_warning("""A redirect from 'www.%s' has been disabled for this domain because you have set a custom DNS record on the www subdomain.""" % domain)
+
 	# Since DNSSEC is optional, if a DS record is NOT set at the registrar suggest it.
 	# (If it was set, we did the check earlier.)
 	if query_dns(domain, "DS", nxdomain=None) is None:
@@ -386,7 +416,9 @@ def check_dnssec(domain, env, output, dns_zonefiles, is_checking_primary=False):
 	# See if the domain has a DS record set at the registrar. The DS record may have
 	# several forms. We have to be prepared to check for any valid record. We've
 	# pre-generated all of the valid digests --- read them in.
-	ds_correct = open('/etc/nsd/zones/' + dns_zonefiles[domain] + '.ds').read().strip().split("\n")
+	ds_file = '/etc/nsd/zones/' + dns_zonefiles[domain] + '.ds'
+	if not os.path.exists(ds_file): return # Domain is in our database but DNS has not yet been updated.
+	ds_correct = open(ds_file).read().strip().split("\n")
 	digests = { }
 	for rr_ds in ds_correct:
 		ds_keytag, ds_alg, ds_digalg, ds_digest = rr_ds.split("\t")[4].split(" ")
@@ -482,7 +514,7 @@ def check_mail_domain(domain, env, output):
 
 	# Check that the postmaster@ email address exists. Not required if the domain has a
 	# catch-all address or domain alias.
-	if "@" + domain not in dict(get_mail_aliases(env)):
+	if "@" + domain not in [address for address, *_ in get_mail_aliases(env)]:
 		check_alias_exists("Postmaster contact address", "postmaster@" + domain, env, output)
 
 	# Stop if the domain is listed in the Spamhaus Domain Block List.
@@ -593,103 +625,115 @@ def check_ssl_cert(domain, rounded_time, env, output):
 			output.print_line(cert_status_details)
 			output.print_line("")
 
-def check_certificate(domain, ssl_certificate, ssl_private_key, warn_if_expiring_soon=True, rounded_time=False):
-	# Use openssl verify to check the status of a certificate.
+def check_certificate(domain, ssl_certificate, ssl_private_key, warn_if_expiring_soon=True, rounded_time=False, just_check_domain=False):
+	# Check that the ssl_certificate & ssl_private_key files are good
+	# for the provided domain.
 
-	# First check that the certificate is for the right domain. The domain
-	# must be found in the Subject Common Name (CN) or be one of the
-	# Subject Alternative Names. A wildcard might also appear as the CN
-	# or in the SAN list, so check for that tool.
-	retcode, cert_dump = shell('check_output', [
-		"openssl", "x509",
-		"-in", ssl_certificate,
-		"-noout", "-text", "-nameopt", "rfc2253",
-		], trap=True)
+	from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey
+	from cryptography.x509 import Certificate, DNSName, ExtensionNotFound, OID_COMMON_NAME, OID_SUBJECT_ALTERNATIVE_NAME
+	import idna
 
-	# If the certificate is catastrophically bad, catch that now and report it.
-	# More information was probably written to stderr (which we aren't capturing),
-	# but it is probably not helpful to the user anyway.
-	if retcode != 0:
-		return ("The SSL certificate appears to be corrupted or not a PEM-formatted SSL certificate file. (%s)" % ssl_certificate, None)
+	# The ssl_certificate file may contain a chain of certificates. We'll
+	# need to split that up before we can pass anything to openssl or
+	# parse them in Python. Parse it with the cryptography library.
+	try:
+		ssl_cert_chain = load_cert_chain(ssl_certificate)
+		cert = load_pem(ssl_cert_chain[0])
+		if not isinstance(cert, Certificate): raise ValueError("This is not a certificate file.")
+	except ValueError as e:
+		return ("There is a problem with the certificate file: %s" % str(e), None)
 
-	cert_dump = cert_dump.split("\n")
-	certificate_names = set()
-	cert_expiration_date = None
-	while len(cert_dump) > 0:
-		line = cert_dump.pop(0)
+	# First check that the domain name is one of the names allowed by
+	# the certificate.
+	if domain is not None:
+		# The domain may be found in the Subject Common Name (CN). This comes back as an IDNA (ASCII)
+		# string, which is the format we store domains in - so good.
+		certificate_names = set()
+		try:
+			certificate_names.add(
+				cert.subject.get_attributes_for_oid(OID_COMMON_NAME)[0].value
+				)
+		except IndexError:
+			# No common name? Certificate is probably generated incorrectly.
+			# But we'll let it error-out when it doesn't find the domain.
+			pass
 
-		# Grab from the Subject Common Name. We include the indentation
-		# at the start of the line in case maybe the cert includes the
-		# common name of some other referenced entity (which would be
-		# indented, I hope).
-		m = re.match("        Subject: CN=([^,]+)", line)
-		if m:
-			certificate_names.add(m.group(1))
-	
-		# Grab from the Subject Alternative Name, which is a comma-delim
-		# list of names, like DNS:mydomain.com, DNS:otherdomain.com.
-		m = re.match("            X509v3 Subject Alternative Name:", line)
-		if m:
-			names = re.split(",\s*", cert_dump.pop(0).strip())
-			for n in names:
-				m = re.match("DNS:(.*)", n)
-				if m:
-					certificate_names.add(m.group(1))
+		# ... or be one of the Subject Alternative Names. The cryptography library handily IDNA-decodes
+		# the names for us. We must encode back to ASCII, but wildcard certificates can't pass through
+		# IDNA encoding/decoding so we must special-case. See https://github.com/pyca/cryptography/pull/2071.
+		def idna_decode_dns_name(dns_name):
+			if dns_name.startswith("*."):
+				return "*." + idna.encode(dns_name[2:]).decode('ascii')
+			else:
+				return idna.encode(dns_name).decode('ascii')
 
-		# Grab the expiration date for testing later.
-		m = re.match("            Not After : (.*)", line)
-		if m:
-			cert_expiration_date = dateutil.parser.parse(m.group(1))
+		try:
+			sans = cert.extensions.get_extension_for_oid(OID_SUBJECT_ALTERNATIVE_NAME).value.get_values_for_type(DNSName)
+			for san in sans:
+				certificate_names.add(idna_decode_dns_name(san))
+		except ExtensionNotFound:
+			pass
 
-	wildcard_domain = re.sub("^[^\.]+", "*", domain)
-	if domain is not None and domain not in certificate_names and wildcard_domain not in certificate_names:
-		return ("The certificate is for the wrong domain name. It is for %s."
-			% ", ".join(sorted(certificate_names)), None)
+		# Check that the domain appears among the acceptable names, or a wildcard
+		# form of the domain name (which is a stricter check than the specs but
+		# should work in normal cases).
+		wildcard_domain = re.sub("^[^\.]+", "*", domain)
+		if domain not in certificate_names and wildcard_domain not in certificate_names:
+			return ("The certificate is for the wrong domain name. It is for %s."
+				% ", ".join(sorted(certificate_names)), None)
 
-	# Second, check that the certificate matches the private key. Get the modulus of the
-	# private key and of the public key in the certificate. They should match. The output
-	# of each command looks like "Modulus=XXXXX".
+	# Second, check that the certificate matches the private key.
 	if ssl_private_key is not None:
-		private_key_modulus = shell('check_output', [
-			"openssl", "rsa",
-			"-inform", "PEM",
-			"-noout", "-modulus",
-			"-in", ssl_private_key])
-		cert_key_modulus = shell('check_output', [
-			"openssl", "x509",
-			"-in", ssl_certificate,
-			"-noout", "-modulus"])
-		if private_key_modulus != cert_key_modulus:
-			return ("The certificate installed at %s does not correspond to the private key at %s." % (ssl_certificate, ssl_private_key), None)
+		try:
+			priv_key = load_pem(open(ssl_private_key, 'rb').read())
+		except ValueError as e:
+			return ("The private key file %s is not a private key file: %s" % (ssl_private_key, str(e)), None)
+
+		if not isinstance(priv_key, RSAPrivateKey):
+			return ("The private key file %s is not a private key file." % ssl_private_key, None)
+
+		if priv_key.public_key().public_numbers() != cert.public_key().public_numbers():
+			return ("The certificate does not correspond to the private key at %s." % ssl_private_key, None)
+
+		# We could also use the openssl command line tool to get the modulus
+		# listed in each file. The output of each command below looks like "Modulus=XXXXX".
+		# $ openssl rsa -inform PEM -noout -modulus -in ssl_private_key
+		# $ openssl x509 -in ssl_certificate -noout -modulus
+
+	# Third, check if the certificate is self-signed. Return a special flag string.
+	if cert.issuer == cert.subject:
+		return ("SELF-SIGNED", None)
+
+	# When selecting which certificate to use for non-primary domains, we check if the primary
+	# certificate or a www-parent-domain certificate is good for the domain. There's no need
+	# to run extra checks beyond this point.
+	if just_check_domain:
+		return ("OK", None)
+
+	# Check that the certificate hasn't expired. The datetimes returned by the
+	# certificate are 'naive' and in UTC. We need to get the current time in UTC.
+	now = datetime.datetime.utcnow()
+	if not(cert.not_valid_before <= now <= cert.not_valid_after):
+		return ("The certificate has expired or is not yet valid. It is valid from %s to %s." % (cert.not_valid_before, cert.not_valid_after), None)
 
 	# Next validate that the certificate is valid. This checks whether the certificate
 	# is self-signed, that the chain of trust makes sense, that it is signed by a CA
 	# that Ubuntu has installed on this machine's list of CAs, and I think that it hasn't
 	# expired.
 
-	# In order to verify with openssl, we need to split out any
-	# intermediary certificates in the chain (if any) from our
-	# certificate (at the top). They need to be passed separately.
-
-	cert = open(ssl_certificate).read()
-	m = re.match(r'(-*BEGIN CERTIFICATE-*.*?-*END CERTIFICATE-*)(.*)', cert, re.S)
-	if m == None:
-		return ("The certificate file is an invalid PEM certificate.", None)
-	mycert, chaincerts = m.groups()
-
+	# The certificate chain has to be passed separately and is given via STDIN.
 	# This command returns a non-zero exit status in most cases, so trap errors.
-
 	retcode, verifyoutput = shell('check_output', [
 		"openssl",
 		"verify", "-verbose",
 		"-purpose", "sslserver", "-policy_check",]
-		+ ([] if chaincerts.strip() == "" else ["-untrusted", "/dev/stdin"])
+		+ ([] if len(ssl_cert_chain) == 1 else ["-untrusted", "/proc/self/fd/0"])
 		+ [ssl_certificate],
-		input=chaincerts.encode('ascii'),
+		input=b"\n\n".join(ssl_cert_chain[1:]),
 		trap=True)
 
 	if "self signed" in verifyoutput:
-		# Certificate is self-signed.
+		# Certificate is self-signed. Probably we detected this above.
 		return ("SELF-SIGNED", None)
 
 	elif retcode != 0:
@@ -704,7 +748,7 @@ def check_certificate(domain, ssl_certificate, ssl_private_key, warn_if_expiring
 		# good.
 
 		# But is it expiring soon?
-		now = datetime.datetime.now(dateutil.tz.tzlocal())
+		cert_expiration_date = cert.not_valid_after
 		ndays = (cert_expiration_date-now).days
 		if not rounded_time or ndays < 7:
 			expiry_info = "The certificate expires in %d days on %s." % (ndays, cert_expiration_date.strftime("%x"))
@@ -720,6 +764,33 @@ def check_certificate(domain, ssl_certificate, ssl_private_key, warn_if_expiring
 
 		# Return the special OK code.
 		return ("OK", expiry_info)
+
+def load_cert_chain(pemfile):
+	# A certificate .pem file may contain a chain of certificates.
+	# Load the file and split them apart.
+	re_pem = rb"(-+BEGIN (?:.+)-+[\r\n]+(?:[A-Za-z0-9+/=]{1,64}[\r\n]+)+-+END (?:.+)-+[\r\n]+)"
+	with open(pemfile, "rb") as f:
+		pem = f.read() + b"\n" # ensure trailing newline
+		pemblocks = re.findall(re_pem, pem)
+		if len(pemblocks) == 0:
+			raise ValueError("File does not contain valid PEM data.")
+		return pemblocks
+
+def load_pem(pem):
+	# Parse a "---BEGIN .... END---" PEM string and return a Python object for it
+	# using classes from the cryptography package.
+	from cryptography.x509 import load_pem_x509_certificate
+	from cryptography.hazmat.primitives import serialization
+	from cryptography.hazmat.backends import default_backend
+	pem_type = re.match(b"-+BEGIN (.*?)-+[\r\n]", pem)
+	if pem_type is None:
+		raise ValueError("File is not a valid PEM-formatted file.")
+	pem_type = pem_type.group(1)
+	if pem_type in (b"RSA PRIVATE KEY", b"PRIVATE KEY"):
+		return serialization.load_pem_private_key(pem, password=None, backend=default_backend())
+	if pem_type == b"CERTIFICATE":
+		return load_pem_x509_certificate(pem, default_backend())
+	raise ValueError("Unsupported PEM object type: " + pem_type.decode("ascii", "replace"))
 
 _apt_updates = None
 def list_apt_updates(apt_update=True):
@@ -754,6 +825,34 @@ def list_apt_updates(apt_update=True):
 	_apt_updates = (datetime.datetime.now(), pkgs)
 
 	return pkgs
+
+def what_version_is_this(env):
+	# This function runs `git describe --abbrev=0` on the Mail-in-a-Box installation directory.
+	# Git may not be installed and Mail-in-a-Box may not have been cloned from github,
+	# so this function may raise all sorts of exceptions.
+	miab_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+	tag = shell("check_output", ["/usr/bin/git", "describe", "--abbrev=0"], env={"GIT_DIR": os.path.join(miab_dir, '.git')}).strip()
+	return tag
+
+def get_latest_miab_version():
+	# This pings https://mailinabox.email/bootstrap.sh and extracts the tag named in
+	# the script to determine the current product version.
+	import urllib.request
+	return re.search(b'TAG=(.*)', urllib.request.urlopen("https://mailinabox.email/bootstrap.sh?ping=1").read()).group(1).decode("utf8")
+
+def check_miab_version(env, output):
+	config = load_settings(env)
+
+	if config.get("privacy", True):
+		output.print_warning("Mail-in-a-Box version check disabled by privacy setting.")
+	else:
+		this_ver = what_version_is_this(env)
+		latest_ver = get_latest_miab_version()
+		if this_ver == latest_ver:
+			output.print_ok("Mail-in-a-Box is up to date. You are running version %s." % this_ver)
+		else:
+			output.print_error("A new version of Mail-in-a-Box is available. You are running version %s. The latest version is %s. For upgrade instructions, see https://mailinabox.email. "
+				% (this_ver, latest_ver))
 
 def run_and_output_changes(env, pool, send_via_email):
 	import json
@@ -821,7 +920,7 @@ def run_and_output_changes(env, pool, send_via_email):
 			if category not in cur_status:
 				out.add_heading(category)
 				out.print_warning("This section was removed.")
-	
+
 	if send_via_email:
 		# If there were changes, send off an email.
 		buf = out.buf.getvalue()
@@ -833,7 +932,7 @@ def run_and_output_changes(env, pool, send_via_email):
 			msg['To'] = "administrator@%s" % env['PRIMARY_HOSTNAME']
 			msg['Subject'] = "[%s] Status Checks Change Notice" % env['PRIMARY_HOSTNAME']
 			msg.set_payload(buf, "UTF-8")
-	
+
 			# send to administrator@
 			import smtplib
 			mailserver = smtplib.SMTP('localhost', 25)
@@ -843,7 +942,7 @@ def run_and_output_changes(env, pool, send_via_email):
 				"administrator@%s" % env['PRIMARY_HOSTNAME'], # RCPT TO
 				msg.as_string())
 			mailserver.quit()
-		
+
 	# Store the current status checks output for next time.
 	os.makedirs(os.path.dirname(cache_fn), exist_ok=True)
 	with open(cache_fn, "w") as f:
@@ -935,3 +1034,6 @@ if __name__ == "__main__":
 		if cert_status != "OK":
 			sys.exit(1)
 		sys.exit(0)
+
+	elif sys.argv[1] == "--version":
+		print(what_version_is_this(env))
